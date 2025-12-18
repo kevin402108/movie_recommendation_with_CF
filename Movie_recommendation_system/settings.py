@@ -78,8 +78,8 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': 'movie_recommend_db',
-        'USER': 'myroot',
-        'PASSWORD': 'rootpwd',
+        'USER': 'root',
+        'PASSWORD': '123456',
         'HOST': 'localhost',
         'PORT': '3306'
     }
