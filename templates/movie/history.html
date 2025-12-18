@@ -49,19 +49,18 @@
                 <p>
                     电影名：
                     {{ rating.movie.name }}
-                    <span>
+                </p>
+                <p>
+                    评分：
+                    <span style="color:#e09015">
                     {% for foo in rating.movie.get_score_int_range %}
-                        ❤
+                        &#x2605;
                     {% endfor %}
                     </span>
                     <strong style="color:#e09015">{{ rating.movie.get_score }}</strong>
                 </p>
-                <p>
-                    我的评分:
-                    <strong style="color:#e09015">{{ rating.score }} </strong>
-                    我的评论:
-                    <strong>{{ rating.comment }}</strong>
-                </p>
+                <p>我的评分:<strong style="color:#e09015"> {{ rating.score }} </strong></p>
+                <p>我的评论:<strong> {{ rating.comment }}</strong></p>
                 {#                <a href="#">#}
                 <button type="button" class="btn btn-warning"
                         onclick="confirm_delete('{% url "movie:delete_record" rating.movie.id %}')"><span

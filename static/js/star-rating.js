@@ -374,7 +374,7 @@
         clearButtonTitle: 'Clear',
         clearButtonBaseClass: 'clear-rating',
         clearButtonActiveClass: 'clear-rating-active',
-        clearCaption: 'Not Rated',
+        clearCaption: '未评分',
         clearCaptionClass: 'label label-default',
         clearValue: 0,
         captionElement: null,

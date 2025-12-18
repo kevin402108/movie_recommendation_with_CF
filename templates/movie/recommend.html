@@ -34,7 +34,7 @@
                 <div class="alert alert-success" role="alert">{{ message }}</div>
             {% endif %}
         {% endfor %}
-        <div class="alert alert-info" role="alert">这是根据你的评分历史推荐出来的10部电影</div>
+        <div class="alert alert-info" role="alert">推荐电影列表</div>
     </div>
 
     {% for movie in movies %}
@@ -53,12 +53,15 @@
                         电影名：
                         {{ movie.name }}
                     </p>
-                    <span>
-                    {% for foo in movie.get_score_int_range %}
-                        ❤
-                    {% endfor %}
-                    </span>
-                    <strong style="color:#e09015">{{ movie.get_score }}</strong>
+                    <p>
+                        <span>评分：</span>
+                        <span style="color:#e09015">
+                            {% for foo in movie.get_score_int_range %}
+                                &#x2605;
+                            {% endfor %}
+                        </span>
+                        <strong style="color:#e09015">{{ movie.get_score }}</strong>
+                    </p>
                     <p style="word-wrap: break-word">
                         简介:
                         {{ movie.intro }}

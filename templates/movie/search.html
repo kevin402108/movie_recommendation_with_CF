@@ -22,7 +22,7 @@
     </style>
     <!--展示电影图片用-->
     <div class="container">
-        <div class="alert alert-success" role="alert">{{ keyword }} 的搜索结果</div>
+        <div class="alert alert-success" role="alert">包含关键词 {{ keyword }} 的搜索结果</div>
 
         {% for movie in movies %}
             <a href="{% url 'movie:detail' movie.pk %}" class="item">
