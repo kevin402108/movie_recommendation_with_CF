@@ -8,7 +8,10 @@ from django.http import HttpResponse, request
 from django.shortcuts import render, redirect, reverse
 from .forms import RegisterForm, LoginForm, CommentForm
 from django.views.generic import View, ListView, DetailView
+from django.contrib.auth.mixins import LoginRequiredMixin
 from .models import User, Movie, Genre, Movie_rating, Movie_similarity, Movie_hot
+import redis
+import json
 
 # DO NOT MAKE ANY CHANGES
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -566,76 +569,60 @@ def delete_recode(request, pk):
     return redirect(reverse('movie:history', args=(user_id,)))
 
 
-class RecommendMovieView(ListView):
-    model = Movie
+class RecommendMovieView(ListView):  
     template_name = 'movie/recommend.html'
-    paginate_by = 15
+    model = Movie
     context_object_name = 'movies'
-    ordering = 'movie_rating__score'
-    page_kwarg = 'p'
+    paginate_by = 10
 
-    def __init__(self):
-        super().__init__()
-        # 最相似的20个用户
-        self.K = 20
-        # 推荐出10本书
-        self.N = 10
-        # 存放当前用户评分过的电影querySet
-        self.cur_user_movie_qs = None
-
-    def get_user_sim(self):
-        # 用户相似度字典，格式为{ user_id1:val , user_id2:val , ... }
-        user_sim_dct = dict()
-        '''获取用户之间的相似度,存放在user_sim_dct中'''
-        # 获取当前用户
-        cur_user_id = self.request.session['user_id']
-        cur_user = User.objects.get(pk=cur_user_id)
-        # 获取其它用户
-        other_users = User.objects.exclude(pk=cur_user_id)
-
-        self.cur_user_movie_qs = Movie.objects.filter(user=cur_user)
-
-        # 计算当前用户与其他用户评分过的电影交集数
-        for user in other_users:
-            # 记录感兴趣的数量
-            user_sim_dct[user.id] = len(Movie.objects.filter(user=user) & self.cur_user_movie_qs)
-
-        # 按照key排序value，返回K个最相近的用户
-        print("user similarity calculated!")
-        # 格式是 [ (user, value), (user, value), ... ]
-        return sorted(user_sim_dct.items(), key=lambda x: -x[1])[:self.K]
-
-    def get_recommend_movie(self, user_lst):
-        # 电影兴趣值字典，{ movie:value, movie:value , ...}
-        movie_val_dct = dict()
-        # print(f'cur_user_movie_qs:{self.cur_user_movie_qs},type:{type(self.cur_user_movie_qs)}')
-        # print(Movie.objects.all() & self.cur_user_movie_qs)
-        # 用户，相似度
-        for user, _ in user_lst:
-            # 获取相似用户评分过的电影，并且不在前用户的评分列表中的，再加上score字段，方便计算兴趣值
-            movie_set = Movie.objects.filter(user=user).exclude(id__in=self.cur_user_movie_qs).annotate(
-                score=Max('movie_rating__score'))
-            for movie in movie_set:
-                movie_val_dct.setdefault(movie, 0)
-                # 累计用户的评分
-                movie_val_dct[movie] += movie.score
-        print('recommend movie list calculated!')
-        return sorted(movie_val_dct.items(), key=lambda x: -x[1])[:self.N]
+    def get(self, request, *args, **kwargs):
+        # 自己实现登录检查
+        if not request.session.get('user_id'):
+            # 如果用户未登录，重定向到登录页面
+            return redirect(reverse('movie:login'))
+        return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
-        s = time.time()
-        # 获得最相似的K个用户列表
-        user_lst = self.get_user_sim()
-        # 获得推荐电影的id
-        movie_lst = self.get_recommend_movie(user_lst)
-        print(movie_lst)
-        result_lst = []
-        for movie, _ in movie_lst:
-            result_lst.append(movie)
-        e = time.time()
-        print(f"用时:{e - s}")
-        return result_lst
-
+        # 从session获取用户ID，而不是从request.user
+        user_id = self.request.session.get('user_id')
+        
+        if not user_id:
+            return Movie.objects.none()
+            
+        try:
+            # 添加Redis连接错误处理
+            self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+            self.redis_client.ping()  # 检查连接是否成功
+            
+            # 从Redis获取推荐结果
+            recommend_data = self.redis_client.get(f'recommend:{user_id}')
+            
+            if recommend_data:
+                # 如果Redis中有推荐数据，解析并返回
+                recommend_list = json.loads(recommend_data)
+                movie_ids = [movie_id for movie_id, _ in recommend_list]
+                return Movie.objects.filter(id__in=movie_ids)
+            else:
+                # 如果Redis中没有推荐数据，自动生成推荐
+                print(f"Redis中没有用户 {user_id} 的推荐数据，正在生成...")
+                
+                # 生成推荐并存入Redis
+                generate_success = generate_recommendations_for_user(user_id)
+                
+                if generate_success:
+                    # 重新从Redis获取推荐结果
+                    recommend_data = self.redis_client.get(f'recommend:{user_id}')
+                    if recommend_data:
+                        recommend_list = json.loads(recommend_data)
+                        movie_ids = [movie_id for movie_id, _ in recommend_list]
+                        return Movie.objects.filter(id__in=movie_ids)
+                
+                # 如果生成推荐失败，返回空列表
+                return Movie.objects.none()
+        except redis.RedisError as e:
+            # Redis连接失败，记录错误并返回空列表
+            print(f"Redis连接错误: {e}")
+            return Movie.objects.none()
     def get_context_data(self, *, object_list=None, **kwargs):
         context = super(RecommendMovieView, self).get_context_data(*kwargs)
         paginator = context.get('paginator')
@@ -667,3 +654,145 @@ class RecommendMovieView(ListView):
             'left_has_more': left_has_more,
             'right_has_more': right_has_more
         }
+
+
+
+def generate_recommendations_for_user(user_id):
+    # 配置MySQL连接
+    mysql_params = {
+        'host': 'localhost',
+        'port': 3306,
+        'user': 'root',
+        'password': '123450',
+        'database': 'movie_recommend_db',
+        'charset': 'utf8mb4'
+    }
+    
+    # 从MySQL读取数据
+    def read_from_mysql():
+        conn = pymysql.connect(**mysql_params)
+        try:
+            # 读取用户评分数据
+            df = pd.read_sql('SELECT user_id, movie_id, score FROM movie_rating', conn)
+            return df
+        finally:
+            conn.close()
+    
+    # 实现UserCF算法，支持为单个用户生成推荐
+    def user_cf_recommendation(ratings_df, target_user_id):
+        # 创建用户-电影评分矩阵
+        user_movie_matrix = ratings_df.pivot_table(index='user_id', columns='movie_id', values='score')
+        
+        # 计算用户之间的相似度（使用皮尔逊相关系数）
+        user_similarity = user_movie_matrix.T.corr()
+        
+        # 生成推荐
+        recommendations = {}
+        
+        if target_user_id not in user_similarity.index:
+            print(f"警告：用户ID {target_user_id} 不存在于评分数据中")
+            return recommendations
+            
+        # 获取当前用户的评分
+        user_ratings = user_movie_matrix.loc[target_user_id].dropna()
+        
+        # 存储推荐结果
+        recommendations_for_user = {}
+        
+        # 遍历其他用户
+        for other_user_id in user_similarity.index:
+            if target_user_id == other_user_id:
+                continue
+            
+            # 获取相似度
+            similarity = user_similarity.loc[target_user_id, other_user_id]
+            if np.isnan(similarity):
+                continue
+            
+            # 获取其他用户的评分
+            other_ratings = user_movie_matrix.loc[other_user_id].dropna()
+            
+            # 找到当前用户未评分的电影
+            unrated_movies = other_ratings.index.difference(user_ratings.index)
+            
+            # 为这些电影计算推荐分数
+            for movie_id in unrated_movies:
+                score = other_ratings.loc[movie_id]
+                weighted_score = similarity * score
+                
+                if movie_id not in recommendations_for_user:
+                    recommendations_for_user[movie_id] = {'total_score': 0, 'total_similarity': 0}
+                
+                recommendations_for_user[movie_id]['total_score'] += weighted_score
+                recommendations_for_user[movie_id]['total_similarity'] += similarity
+        
+        # 计算最终推荐分数
+        user_recommendations = []
+        for movie_id, scores in recommendations_for_user.items():
+            if scores['total_similarity'] > 0:
+                final_score = scores['total_score'] / scores['total_similarity']
+                user_recommendations.append((movie_id, final_score))
+        
+        # 按推荐分数降序排序
+        user_recommendations.sort(key=lambda x: x[1], reverse=True)
+        
+        # 保存前10个推荐
+        recommendations[target_user_id] = user_recommendations[:10]
+        
+        return recommendations
+    
+    # 将推荐结果写入Redis
+    def write_to_redis(recommendations, redis_host='localhost', redis_port=6379, redis_db=0):
+        try:
+            # 连接Redis
+            redis_client = redis.Redis(host=redis_host, port=redis_port, db=redis_db, decode_responses=True)
+            
+            # 检查连接是否成功
+            redis_client.ping()
+            print(f"成功连接到Redis服务器: {redis_host}:{redis_port}")
+            
+            # 写入Redis
+            count = 0
+            for user_id, recommend_list in recommendations.items():
+                # 转换为Redis存储格式：[(movie_id, score), ...]
+                formatted_list = [(int(movie_id), float(score)) for movie_id, score in recommend_list]
+                
+                # 写入Redis，键格式为'recommend:{user_id}'
+                key = f'recommend:{int(user_id)}'
+                redis_client.set(key, json.dumps(formatted_list))
+                
+                # 验证写入是否成功
+                if redis_client.exists(key):
+                    count += 1
+                
+                print(f'User {user_id}: {formatted_list}')
+            
+            print(f"成功写入 {count} 条推荐数据到Redis")
+            return True
+        except redis.RedisError as e:
+            print(f"Redis连接或写入错误: {e}")
+            return False
+        except Exception as e:
+            print(f"其他错误: {e}")
+            return False
+    
+    # 直接实现生成推荐的逻辑，不再嵌套定义同名函数
+    try:
+        # 从MySQL读取数据
+        print(f'正在为用户 {user_id} 生成推荐...')
+        ratings_df = read_from_mysql()
+        
+        # 实现UserCF推荐算法
+        recommendations = user_cf_recommendation(ratings_df, user_id)
+        
+        if not recommendations:
+            print(f"警告：没有为用户 {user_id} 生成任何推荐结果！")
+            return False
+        
+        # 将推荐结果写入Redis
+        return write_to_redis(recommendations)
+    except Exception as e:
+        print(f"生成推荐时发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
