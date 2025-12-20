@@ -1,3 +1,8 @@
 .idea/
 .DS_Store
 database/.DS_Store
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

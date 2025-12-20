@@ -250,22 +250,23 @@ class PopularMovieView(ListView):
         # print(movies)
         # print(movies.values("nums"))
         # for movie in movies:
-            # print(movie,movie.nums)
-            # record = Movie_hot(movie=movie, rating_number=movie.nums)
-            # record.save()
+        # print(movie,movie.nums)
+        # record = Movie_hot(movie=movie, rating_number=movie.nums)
+        # record.save()
         # ######################
 
-        hot_movies=Movie_hot.objects.all().values("movie_id")
+        hot_movies = Movie_hot.objects.all().values("movie_id")
         # print(hot_movies)
         # for movie in hot_movies:
-            # print(movie)
-            # print(movie.imdb_id,movie.rating_number)
+        # print(movie)
+        # print(movie.imdb_id,movie.rating_number)
         # Movie.objects.filter(movie_hot__rating_number=)
         # 一个bug!这里filter出来虽然是正确的100部电影，但是会按照imdb_id排序，导致正确的结果被破坏了！也就是得不到100部热门电影的正确顺序！
         # movies=Movie.objects.filter(id__in=hot_movies.values("imdb_id"))
         # 找出100部热门电影，同时按照评分人数排序
         # 因此我们必须要手动排序一次。另外也不太好用
-        movies=Movie.objects.filter(id__in=hot_movies).annotate(nums=Max('movie_hot__rating_number')).order_by('-nums')
+        movies = Movie.objects.filter(id__in=hot_movies).annotate(nums=Max('movie_hot__rating_number')).order_by(
+            '-nums')
         return movies
 
     def get_context_data(self, *, object_list=None, **kwargs):
@@ -582,7 +583,26 @@ def delete_recode(request, pk):
     return redirect(reverse('movie:history', args=(user_id,)))
 
 
-class RecommendMovieView(ListView):  
+class RatingHistoryView(DetailView):
+    '''用户详情页面'''
+    model = User
+    template_name = 'movie/history.html'
+    # 上下文对象的名称
+    context_object_name = 'user'
+
+    def get_context_data(self, **kwargs):
+        # 这里要增加的对象：当前用户过的电影历史
+        context = super().get_context_data(**kwargs)
+        user_id = self.request.session['user_id']
+        user = User.objects.get(pk=user_id)
+        # 获取ratings即可
+        ratings = Movie_rating.objects.filter(user=user)
+
+        context.update({'ratings': ratings})
+        return context
+
+
+class RecommendMovieView(ListView):
     template_name = 'movie/recommend.html'
     model = Movie
     context_object_name = 'movies'
@@ -598,18 +618,18 @@ class RecommendMovieView(ListView):
     def get_queryset(self):
         # 从session获取用户ID，而不是从request.user
         user_id = self.request.session.get('user_id')
-        
+
         if not user_id:
             return Movie.objects.none()
-            
+
         try:
             # 添加Redis连接错误处理
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
             self.redis_client.ping()  # 检查连接是否成功
-            
+
             # 从Redis获取推荐结果
             recommend_data = self.redis_client.get(f'recommend:{user_id}')
-            
+
             if recommend_data:
                 # 如果Redis中有推荐数据，解析并返回
                 recommend_list = json.loads(recommend_data)
@@ -618,10 +638,10 @@ class RecommendMovieView(ListView):
             else:
                 # 如果Redis中没有推荐数据，自动生成推荐
                 print(f"Redis中没有用户 {user_id} 的推荐数据，正在生成...")
-                
+
                 # 生成推荐并存入Redis
                 generate_success = generate_recommendations_for_user(user_id)
-                
+
                 if generate_success:
                     # 重新从Redis获取推荐结果
                     recommend_data = self.redis_client.get(f'recommend:{user_id}')
@@ -629,13 +649,14 @@ class RecommendMovieView(ListView):
                         recommend_list = json.loads(recommend_data)
                         movie_ids = [movie_id for movie_id, _ in recommend_list]
                         return Movie.objects.filter(id__in=movie_ids)
-                
+
                 # 如果生成推荐失败，返回空列表
                 return Movie.objects.none()
         except redis.RedisError as e:
             # Redis连接失败，记录错误并返回空列表
             print(f"Redis连接错误: {e}")
             return Movie.objects.none()
+
     def get_context_data(self, *, object_list=None, **kwargs):
         context = super(RecommendMovieView, self).get_context_data(*kwargs)
         paginator = context.get('paginator')
@@ -669,35 +690,173 @@ class RecommendMovieView(ListView):
         }
 
 
+def generate_recommendations_with_pandas(user_id):
+    # 原始的Pandas实现
+    mysql_params = {
+        'host': 'localhost',
+        'port': 3306,
+        'user': 'root',
+        'password': '123456',
+        'database': 'movie_recommend_db',
+        'charset': 'utf8mb4'
+    }
+
+    # 从MySQL读取数据
+    def read_from_mysql():
+        conn = pymysql.connect(**mysql_params)
+        try:
+            # 读取用户评分数据
+            df = pd.read_sql('SELECT user_id, movie_id, score FROM movie_rating', conn)
+            return df
+        finally:
+            conn.close()
+
+    # 实现UserCF算法，支持为单个用户生成推荐
+    def user_cf_recommendation(ratings_df, target_user_id):
+        # 创建用户-电影评分矩阵
+        user_movie_matrix = ratings_df.pivot_table(index='user_id', columns='movie_id', values='score')
+
+        # 计算用户之间的相似度（使用皮尔逊相关系数）
+        user_similarity = user_movie_matrix.T.corr()
+
+        # 生成推荐
+        recommendations = {}
+
+        if target_user_id not in user_similarity.index:
+            print(f"警告：用户ID {target_user_id} 不存在于评分数据中")
+            return recommendations
+
+        # 获取当前用户的评分
+        user_ratings = user_movie_matrix.loc[target_user_id].dropna()
+
+        # 存储推荐结果
+        recommendations_for_user = {}
+
+        # 遍历其他用户
+        for other_user_id in user_similarity.index:
+            if target_user_id == other_user_id:
+                continue
+
+            # 获取相似度
+            similarity = user_similarity.loc[target_user_id, other_user_id]
+            if np.isnan(similarity):
+                continue
+
+            # 获取其他用户的评分
+            other_ratings = user_movie_matrix.loc[other_user_id].dropna()
+
+            # 找到当前用户未评分的电影
+            unrated_movies = other_ratings.index.difference(user_ratings.index)
+
+            # 为这些电影计算推荐分数
+            for movie_id in unrated_movies:
+                score = other_ratings.loc[movie_id]
+                weighted_score = similarity * score
+
+                if movie_id not in recommendations_for_user:
+                    recommendations_for_user[movie_id] = {'total_score': 0, 'total_similarity': 0}
+
+                recommendations_for_user[movie_id]['total_score'] += weighted_score
+                recommendations_for_user[movie_id]['total_similarity'] += similarity
+
+        # 计算最终推荐分数
+        user_recommendations = []
+        for movie_id, scores in recommendations_for_user.items():
+            if scores['total_similarity'] > 0:
+                final_score = scores['total_score'] / scores['total_similarity']
+                user_recommendations.append((movie_id, final_score))
+
+        # 按推荐分数降序排序
+        user_recommendations.sort(key=lambda x: x[1], reverse=True)
+        recommendations[target_user_id] = user_recommendations[:10]
+
+        return recommendations
+
+    # 将推荐结果写入Redis
+    def write_to_redis(recommendations, redis_host='localhost', redis_port=6379, redis_db=0):
+        try:
+            # 连接Redis
+            redis_client = redis.Redis(host=redis_host, port=redis_port, db=redis_db, decode_responses=True)
+
+            # 检查连接是否成功
+            redis_client.ping()
+            print(f"成功连接到Redis服务器: {redis_host}:{redis_port}")
+
+            # 写入Redis
+            count = 0
+            for user_id, recommend_list in recommendations.items():
+                # 转换为Redis存储格式：[(movie_id, score), ...]
+                formatted_list = [(int(movie_id), float(score)) for movie_id, score in recommend_list]
+
+                # 写入Redis，键格式为'recommend:{user_id}'
+                key = f'recommend:{int(user_id)}'
+                redis_client.set(key, json.dumps(formatted_list))
+
+                # 验证写入是否成功
+                if redis_client.exists(key):
+                    count += 1
+
+                print(f'User {user_id}: {formatted_list}')
+
+            print(f"成功写入 {count} 条推荐数据到Redis")
+            return True
+        except redis.RedisError as e:
+            print(f"Redis连接或写入错误: {e}")
+            return False
+        except Exception as e:
+            print(f"其他错误: {e}")
+            return False
+
+    try:
+        # 从MySQL读取数据
+        print(f'正在使用Pandas为用户 {user_id} 生成推荐...')
+        ratings_df = read_from_mysql()
+
+        # 实现UserCF推荐算法
+        recommendations = user_cf_recommendation(ratings_df, user_id)
+
+        if not recommendations:
+            print(f"警告：没有为用户 {user_id} 生成任何推荐结果！")
+            return False
+
+        # 将推荐结果写入Redis
+        return write_to_redis(recommendations)
+    except Exception as e:
+        print(f"生成推荐时发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def generate_recommendations_for_user(user_id):
     # 配置MySQL连接
     mysql_params = {
         'host': 'localhost',
         'port': 3306,
         'user': 'root',
-        'password': '123450',
+        'password': '123456',
         'database': 'movie_recommend_db',
         'charset': 'utf8mb4'
     }
-    
+
     # 配置Redis连接
     redis_params = {
         'host': 'localhost',
         'port': 6379,
         'db': 0
     }
-    
+
     try:
         print(f'正在使用PyFlink为用户 {user_id} 生成推荐...')
-        
+
         # 创建PyFlink流处理环境
         env = StreamExecutionEnvironment.get_execution_environment()
         env.set_runtime_mode(RuntimeExecutionMode.BATCH)
-        
+
         # 创建表环境
         settings = EnvironmentSettings.new_instance().in_batch_mode().build()
         table_env = StreamTableEnvironment.create(env, environment_settings=settings)
-        
+
         # 注册MySQL数据源表
         table_env.execute_sql(f"""
             CREATE TABLE ratings (
@@ -713,109 +872,107 @@ def generate_recommendations_for_user(user_id):
                 'driver' = 'com.mysql.cj.jdbc.Driver'
             )
         """)
-        
+
         # 收集所有评分数据到Python端进行处理
         # 注意：对于大数据量，应该使用PyFlink的UDF进行分布式处理
         # 这里为了简化实现，先将数据收集到Python端
         ratings_data = table_env.sql_query("SELECT user_id, movie_id, score FROM ratings").to_pandas()
-        
+
         if ratings_data.empty:
             print("警告：没有找到任何评分数据！")
             return False
-        
+
         # 实现UserCF算法
         def user_cf_recommendation(ratings_df, target_user_id):
             # 创建用户-电影评分矩阵
             user_movie_matrix = ratings_df.pivot_table(index='user_id', columns='movie_id', values='score')
-            
+
             # 计算用户之间的相似度（使用皮尔逊相关系数）
             user_similarity = user_movie_matrix.T.corr()
-            
+
             # 生成推荐
             recommendations = {}
-            
+
             if target_user_id not in user_similarity.index:
                 print(f"警告：用户ID {target_user_id} 不存在于评分数据中")
                 return recommendations
-                
+
             # 获取当前用户的评分
             user_ratings = user_movie_matrix.loc[target_user_id].dropna()
-            
+
             # 存储推荐结果
             recommendations_for_user = {}
-            
+
             # 遍历其他用户
             for other_user_id in user_similarity.index:
                 if target_user_id == other_user_id:
                     continue
-                
+
                 # 获取相似度
                 similarity = user_similarity.loc[target_user_id, other_user_id]
                 if np.isnan(similarity):
                     continue
-                
+
                 # 获取其他用户的评分
                 other_ratings = user_movie_matrix.loc[other_user_id].dropna()
-                
+
                 # 找到当前用户未评分的电影
                 unrated_movies = other_ratings.index.difference(user_ratings.index)
-                
+
                 # 为这些电影计算推荐分数
                 for movie_id in unrated_movies:
                     score = other_ratings.loc[movie_id]
                     weighted_score = similarity * score
-                    
+
                     if movie_id not in recommendations_for_user:
                         recommendations_for_user[movie_id] = {'total_score': 0, 'total_similarity': 0}
-                    
+
                     recommendations_for_user[movie_id]['total_score'] += weighted_score
                     recommendations_for_user[movie_id]['total_similarity'] += similarity
-            
+
             # 计算最终推荐分数
             user_recommendations = []
             for movie_id, scores in recommendations_for_user.items():
                 if scores['total_similarity'] > 0:
                     final_score = scores['total_score'] / scores['total_similarity']
                     user_recommendations.append((movie_id, final_score))
-            
+
             # 按推荐分数降序排序
             user_recommendations.sort(key=lambda x: x[1], reverse=True)
             recommendations[target_user_id] = user_recommendations[:10]
-            
+
             return recommendations
-        
+
         # 生成推荐
         recommendations = user_cf_recommendation(ratings_data, user_id)
-        
+
         if not recommendations:
             print(f"警告：没有为用户 {user_id} 生成任何推荐结果！")
             return False
-        
+
         # 将推荐结果写入Redis
         try:
             redis_client = redis.Redis(**redis_params, decode_responses=True)
             redis_client.ping()  # 检查连接是否成功
-            
+
             # 格式化推荐数据
             formatted_recommendations = [(int(movie_id), float(score)) for movie_id, score in recommendations[user_id]]
-            
+
             # 写入Redis
             key = f'recommend:{user_id}'
             redis_client.set(key, json.dumps(formatted_recommendations))
-            
+
             print(f'成功使用PyFlink为用户 {user_id} 生成推荐，并存入Redis')
             return True
         except Exception as e:
             print(f'写入Redis时出错: {e}')
             return False
-            
+
     except Exception as e:
         print(f'使用PyFlink生成推荐时发生错误: {e}')
         import traceback
         traceback.print_exc()
-        
+
         # 如果PyFlink执行失败，回退到原始的Pandas实现
         print('PyFlink执行失败，回退到原始的Pandas实现')
         return generate_recommendations_with_pandas(user_id)
-
-
