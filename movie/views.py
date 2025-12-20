@@ -12,6 +12,15 @@ from django.contrib.auth.mixins import LoginRequiredMixin
 from .models import User, Movie, Genre, Movie_rating, Movie_similarity, Movie_hot
 import redis
 import json
+import pymysql
+import pandas as pd
+import numpy as np
+
+# PyFlink 相关导入
+from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
+from pyflink.table import StreamTableEnvironment, EnvironmentSettings, DataTypes, Schema
+from pyflink.table.expressions import col, lit
+from pyflink.table.udf import udf
 
 # DO NOT MAKE ANY CHANGES
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -25,7 +34,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #     with open(path) as fb:
 #         for line in fb:
 #             Genre.objects.create(name=line.strip())
-#
+
 # def get_movie_info():
 #     '''导入所有电影信息，设置它们的类型'''
 #     path=os.path.join(BASE,'static\movie\info\info.csv')
@@ -57,7 +66,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #             if i%1000==0:
 #                 print(i)    # 控制台查看进度用
 #             # pass
-#
+
 # def get_user_and_rating():
 #     '''
 #     获取ratings文件，设置用户信息和对电影的评分
@@ -93,7 +102,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #             # break
 #         print(f'{user_id} process success')
 #         # break
-#
+
 # def index(request):
 #     # 临时的index函数，用来导入数据库
 #     # get_genre()
@@ -134,7 +143,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #     for user_id,ratings in user_id_dct.items():
 #         # 获取用户
 #         u=User.objects.get(name=user_id)
-#
+
 #         # 开始加入评分记录
 #         for imdb_id,rating in ratings.items():
 #             # Movie_rating(uid=)
@@ -172,7 +181,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #             # 保存记录到数据库中,因为csv表中存储了每部电影的十条记录，我们保存就行了
 #             record=Movie_similarity(movie_source=movie1,movie_target=movie2,similarity=val)
 #             record.save()
-#
+
 #     print("写入相似度成功")
 #     return redirect((reverse('movie:index')))
 
@@ -518,23 +527,45 @@ class MovieDetailView(DetailView):
             rating = Movie_rating.objects.filter(user=user, movie=movie).first()
             if rating:
                 # 如果存在则更新
-                # print(rating)
                 rating.score = score
                 rating.comment = comment
                 rating.save()
-                # messages.info(request,"更新评分成功！")
+                messages.info(request, f"更新 {movie.name} 评分记录成功！")
             else:
-                print('记录不存在')
-                # 如果不存在则添加
-                rating = Movie_rating(user=user, movie=movie, score=score, comment=comment)
-                rating.save()
-            messages.info(request, "评论成功!")
-
+                # 如果不存在则创建
+                relation = Movie_rating(user=user, movie=movie, score=score, comment=comment)
+                relation.save()
+                messages.info(request, f"添加 {movie.name} 评分记录成功！")
+            return redirect(url)
         else:
-            # 表单没有验证通过
-            messages.info(request, "评分不能为空!")
-        return redirect(reverse('movie:detail', args=(pk,)))
+            errors = form.get_errors()
+            for error in errors:
+                messages.info(request, error)
+            print(form.errors.get_json_data())
+            return redirect(url)
 
+
+class MovieHistoryView(ListView):
+    model = User
+    template_name = 'movie/history.html'
+    context_object_name = 'user'
+
+    def get_queryset(self):
+        pk = self.kwargs.get('pk')
+        user = User.objects.get(pk=pk)
+        return user
+
+    def get_context_data(self, **kwargs):
+        context = super(MovieHistoryView, self).get_context_data(**kwargs)
+        # 获取当前用户
+        pk = self.kwargs.get('pk')
+        user = User.objects.get(pk=pk)
+
+        # 获取ratings即可
+        ratings = Movie_rating.objects.filter(user=user)
+
+        context.update({'ratings': ratings})
+        return context
 
 class RatingHistoryView(DetailView):
     '''用户详情页面'''
@@ -553,7 +584,6 @@ class RatingHistoryView(DetailView):
 
         context.update({'ratings': ratings})
         return context
-
 
 def delete_recode(request, pk):
     print(pk)
@@ -656,9 +686,144 @@ class RecommendMovieView(ListView):
         }
 
 
-
 def generate_recommendations_for_user(user_id):
-    # 配置MySQL连接
+    """
+    使用PyFlink实现完整的UserCF协同过滤推荐算法
+    """
+    try:
+        # 创建Flink批处理环境
+        env = StreamExecutionEnvironment.get_execution_environment()
+        env.set_runtime_mode(RuntimeExecutionMode.BATCH)
+        env.set_parallelism(4)
+        
+        # 创建表环境
+        t_env = StreamTableEnvironment.create(env)
+        
+        # 配置JDBC连接器
+        mysql_params = {
+            'url': 'jdbc:mysql://127.0.0.1:3306/movie_recommend_db?serverTimezone=UTC&useSSL=false',
+            'driver': 'com.mysql.cj.jdbc.Driver',
+            'user': 'root',
+            'password': '123450'
+        }
+        
+        # 注册MySQL数据源表
+        t_env.execute_sql(f"""
+            CREATE TABLE movie_ratings (
+                user_id INT,
+                movie_id INT,
+                score DOUBLE
+            ) WITH (
+                'connector' = 'jdbc',
+                'url' = '{mysql_params["url"]}',
+                'driver' = '{mysql_params["driver"]}',
+                'table-name' = 'movie_rating',
+                'username' = '{mysql_params["user"]}',
+                'password' = '{mysql_params["password"]}'
+            )
+        """)
+        
+        # 使用纯SQL查询链计算推荐 - 完全移除UDF依赖
+        recommendations_query = f"""
+            WITH 
+            -- 目标用户已评分电影
+            target_user_ratings AS (
+                SELECT movie_id, score
+                FROM movie_ratings
+                WHERE user_id = {user_id}
+            ),
+            -- 其他用户的评分
+            other_users_ratings AS (
+                SELECT user_id, movie_id, score
+                FROM movie_ratings
+                WHERE user_id <> {user_id}
+            ),
+            -- 计算用户之间的共同评分统计数据
+            user_similarity_stats AS (
+                SELECT 
+                    o.user_id,
+                    COUNT(*) AS n,
+                    SUM(o.score * t.score) AS sum_xy,
+                    SUM(o.score) AS sum_x,
+                    SUM(t.score) AS sum_y,
+                    SUM(o.score * o.score) AS sum_x2,
+                    SUM(t.score * t.score) AS sum_y2
+                FROM other_users_ratings o
+                JOIN target_user_ratings t ON o.movie_id = t.movie_id
+                GROUP BY o.user_id
+            ),
+            -- 计算用户相似度（纯SQL实现皮尔逊相关系数）
+            user_similarities AS (
+                SELECT 
+                    user_id,
+                    n,
+                    CASE
+                        WHEN n < 2 THEN 0.0
+                        WHEN (n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y) = 0 THEN 0.0
+                        ELSE (n * sum_xy - sum_x * sum_y) / 
+                             SQRT((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y))
+                    END AS similarity
+                FROM user_similarity_stats
+                WHERE n >= 2
+            ),
+            -- 候选电影（相似用户评分的、目标用户未评分的电影）
+            candidate_movies AS (
+                SELECT DISTINCT o.movie_id
+                FROM other_users_ratings o
+                JOIN user_similarities s ON o.user_id = s.user_id
+                WHERE s.similarity > 0.1
+                AND o.movie_id NOT IN (
+                    SELECT movie_id FROM target_user_ratings
+                )
+            ),
+            -- 计算推荐分数
+            recommendation_scores AS (
+                SELECT 
+                    o.movie_id,
+                    SUM(o.score * s.similarity) AS weighted_score_sum,
+                    SUM(s.similarity) AS similarity_sum,
+                    COUNT(DISTINCT o.user_id) AS user_count
+                FROM other_users_ratings o
+                JOIN user_similarities s ON o.user_id = s.user_id
+                JOIN candidate_movies c ON o.movie_id = c.movie_id
+                GROUP BY o.movie_id
+            )
+            -- 生成最终推荐
+            SELECT 
+                movie_id,
+                (weighted_score_sum / similarity_sum) AS recommend_score
+            FROM recommendation_scores
+            WHERE user_count >= 2
+            ORDER BY recommend_score DESC
+            LIMIT 30
+        """
+        
+        # 执行推荐查询并获取结果
+        print(f"执行推荐查询...")
+        result = t_env.execute_sql(recommendations_query).collect()
+        
+        # 将结果写入Redis缓存
+        redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        
+        if result:
+            # 转换为推荐列表格式 [(movie_id, score), ...] - 使用索引访问代替点语法
+            recommendations_list = [(int(row[0]), float(row[1])) for row in result]
+            redis_client.setex(f'recommend:{user_id}', 1800, json.dumps(recommendations_list))
+            print(f"成功为用户 {user_id} 生成推荐，已存入Redis")
+            return True
+        else:
+            print(f"未为用户 {user_id} 生成任何推荐结果")
+            return False
+            
+    except Exception as e:
+        print(f"PyFlink推荐算法执行错误: {e}")
+        import traceback
+        traceback.print_exc()
+        # 发生错误时回退到Pandas实现
+        return generate_recommendations_with_pandas(user_id)
+
+def generate_recommendations_with_pandas(user_id):
+    # 原始的Pandas实现
     mysql_params = {
         'host': 'localhost',
         'port': 3306,
@@ -735,8 +900,6 @@ def generate_recommendations_for_user(user_id):
         
         # 按推荐分数降序排序
         user_recommendations.sort(key=lambda x: x[1], reverse=True)
-        
-        # 保存前10个推荐
         recommendations[target_user_id] = user_recommendations[:10]
         
         return recommendations
@@ -759,7 +922,7 @@ def generate_recommendations_for_user(user_id):
                 
                 # 写入Redis，键格式为'recommend:{user_id}'
                 key = f'recommend:{int(user_id)}'
-                redis_client.set(key, json.dumps(formatted_list))
+                redis_client.set(key, json.dumps(formatted_list), ex=1800) 
                 
                 # 验证写入是否成功
                 if redis_client.exists(key):
@@ -776,10 +939,9 @@ def generate_recommendations_for_user(user_id):
             print(f"其他错误: {e}")
             return False
     
-    # 直接实现生成推荐的逻辑，不再嵌套定义同名函数
     try:
         # 从MySQL读取数据
-        print(f'正在为用户 {user_id} 生成推荐...')
+        print(f'正在使用Pandas为用户 {user_id} 生成推荐...')
         ratings_df = read_from_mysql()
         
         # 实现UserCF推荐算法
