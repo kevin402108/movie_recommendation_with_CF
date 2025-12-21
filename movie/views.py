@@ -704,7 +704,7 @@ def generate_recommendations_for_user(user_id):
             'url': 'jdbc:mysql://127.0.0.1:3306/movie_recommend_db?serverTimezone=UTC&useSSL=false',
             'driver': 'com.mysql.cj.jdbc.Driver',
             'user': 'root',
-            'password': '123450'
+            'password': '123456'
         }
         
         # 注册MySQL数据源表
@@ -828,7 +828,7 @@ def generate_recommendations_with_pandas(user_id):
         'host': 'localhost',
         'port': 3306,
         'user': 'root',
-        'password': '123450',
+        'password': '123456',
         'database': 'movie_recommend_db',
         'charset': 'utf8mb4'
     }
