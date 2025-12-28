@@ -75,6 +75,16 @@
                             {% endif %}
                         {% endfor %}
                     </p>
+                    {% if recommendations %}
+                    {% for movie_id, score in recommendations %}
+                        {% if movie.id == movie_id %}
+                            <p>
+                                <span>推荐度：</span>
+                                <span style="color:#007bff;">{{score|floatformat:1}}</span>
+                            </p>
+                        {% endif %}
+                    {% endfor %}
+                {% endif %}
                 </div>
 {#            </div>#}
         </div>

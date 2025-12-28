@@ -1,14 +1,15 @@
-import csv
-import time
+# import csv
+# import time
 import os.path
-from math import sqrt
+# from math import sqrt
 from django.contrib import messages
-from django.db.models import Avg, Count, Max
-from django.http import HttpResponse, request
+from django.db.models import Avg, Count, Max, Case, When
+# from django.http import HttpResponse, request
 from django.shortcuts import render, redirect, reverse
+
 from .forms import RegisterForm, LoginForm, CommentForm
 from django.views.generic import View, ListView, DetailView
-from django.contrib.auth.mixins import LoginRequiredMixin
+# from django.contrib.auth.mixins import LoginRequiredMixin
 from .models import User, Movie, Genre, Movie_rating, Movie_similarity, Movie_hot
 import redis
 import json
@@ -19,8 +20,8 @@ import numpy as np
 # PyFlink 相关导入
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.table import StreamTableEnvironment, EnvironmentSettings, DataTypes, Schema
-from pyflink.table.expressions import col, lit
-from pyflink.table.udf import udf
+# from pyflink.table.expressions import col, lit
+# from pyflink.table.udf import udf
 
 # DO NOT MAKE ANY CHANGES
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -202,7 +203,7 @@ class IndexView(ListView):
         return Movie.objects.filter(imdb_id__lte=1000)
 
     def get_context_data(self, *, object_list=None, **kwargs):
-        context = super(IndexView, self).get_context_data(*kwargs)
+        context = super(IndexView, self).get_context_data(**kwargs)
         paginator = context.get('paginator')
         page_obj = context.get('page_obj')
         pagination_data = self.get_pagination_data(paginator, page_obj)
@@ -244,32 +245,14 @@ class PopularMovieView(ListView):
     page_kwarg = 'p'
 
     def get_queryset(self):
-        # 初始化 计算评分人数最多的100部电影，并保存到数据库中
-        # ######################
-        # movies = Movie.objects.annotate(nums=Count('movie_rating__score')).order_by('-nums')[:100]
-        # print(movies)
-        # print(movies.values("nums"))
-        # for movie in movies:
-            # print(movie,movie.nums)
-            # record = Movie_hot(movie=movie, rating_number=movie.nums)
-            # record.save()
-        # ######################
 
         hot_movies=Movie_hot.objects.all().values("movie_id")
-        # print(hot_movies)
-        # for movie in hot_movies:
-            # print(movie)
-            # print(movie.imdb_id,movie.rating_number)
-        # Movie.objects.filter(movie_hot__rating_number=)
-        # 一个bug!这里filter出来虽然是正确的100部电影，但是会按照imdb_id排序，导致正确的结果被破坏了！也就是得不到100部热门电影的正确顺序！
-        # movies=Movie.objects.filter(id__in=hot_movies.values("imdb_id"))
-        # 找出100部热门电影，同时按照评分人数排序
-        # 因此我们必须要手动排序一次。另外也不太好用
+ 
         movies=Movie.objects.filter(id__in=hot_movies).annotate(nums=Max('movie_hot__rating_number')).order_by('-nums')
         return movies
 
     def get_context_data(self, *, object_list=None, **kwargs):
-        context = super(PopularMovieView, self).get_context_data(*kwargs)
+        context = super(PopularMovieView, self).get_context_data(**kwargs)
         paginator = context.get('paginator')
         page_obj = context.get('page_obj')
         pagination_data = self.get_pagination_data(paginator, page_obj)
@@ -411,7 +394,7 @@ class RegisterView(View):
     def post(self, request):
         form = RegisterForm(request.POST)
         if form.is_valid():
-            # 没毛病，保存
+
             form.save()
             return redirect(reverse('movie:index'))
         else:
@@ -525,6 +508,7 @@ class MovieDetailView(DetailView):
 
             # 更新一条记录
             rating = Movie_rating.objects.filter(user=user, movie=movie).first()
+            is_new_rating = False  # 标记是否是新评分
             if rating:
                 # 如果存在则更新
                 rating.score = score
@@ -536,6 +520,21 @@ class MovieDetailView(DetailView):
                 relation = Movie_rating(user=user, movie=movie, score=score, comment=comment)
                 relation.save()
                 messages.info(request, f"添加 {movie.name} 评分记录成功！")
+                is_new_rating = True
+
+            # 如果是新评分，更新热门电影表
+            if is_new_rating:
+                from django.db.models import F
+                # 尝试获取该电影在热门表中的记录
+                movie_hot = Movie_hot.objects.filter(movie=movie).first()
+                if movie_hot:
+                    # 如果存在则更新评分人数
+                    movie_hot.rating_number = F('rating_number') + 1
+                    movie_hot.save()
+                else:
+                    # 如果不存在则创建新记录，rating_number=1
+                    Movie_hot.objects.create(movie=movie, rating_number=1)
+
             return redirect(url)
         else:
             errors = form.get_errors()
@@ -598,8 +597,42 @@ def delete_recode(request, pk):
     # 跳转回评分历史
     return redirect(reverse('movie:history', args=(user_id,)))
 
+def get_hot_movies_as_recommend():
+     redis_key = "hot_movies_recommend"
+     redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
-class RecommendMovieView(ListView):  
+     # 尝试从 Redis 获取
+     hot_movies_json = redis_client.get(redis_key)
+     if hot_movies_json:
+         hot_movie_ids = json.loads(hot_movies_json)
+         if hot_movie_ids:
+            field_order = ', '.join(str(id) for id in hot_movie_ids)
+            print(f"[热门推荐] 从 Redis 获取热门电影：{hot_movie_ids}")
+            movies = Movie.objects.filter(id__in=hot_movie_ids).extra(
+                select={'manual_order': f'FIELD(id, {field_order})'},
+                order_by=['manual_order']
+            )
+            return movies
+         else:
+             return Movie.objects.none()
+
+     # Redis 没有，从数据库获取热门电影（前50部）
+     print("[热门推荐] Redis 中无热门电影，从数据库查询...")
+     hot_movies_queryset = Movie_hot.objects.order_by('-rating_number').select_related('movie')[:50]
+     hot_movie_ids = [hot.movie.id for hot in hot_movies_queryset]
+     if hot_movie_ids:
+         hot_movies_json_to_store = json.dumps(hot_movie_ids)
+         redis_client.setex(redis_key, 1800, hot_movies_json_to_store)  # 1800秒 = 30分钟
+         print(f"[热门推荐] 已将热门电影存入 Redis，key: {redis_key}，内容：{hot_movie_ids}")
+         field_order = ', '.join(str(id) for id in hot_movie_ids)
+         movies = Movie.objects.filter(id__in=hot_movie_ids).extra(
+             select={'manual_order': f'FIELD(id, {field_order})'},
+             order_by=['manual_order']
+         )
+         return movies
+     return Movie.objects.none()
+
+class RecommendMovieView(ListView):
     template_name = 'movie/recommend.html'
     model = Movie
     context_object_name = 'movies'
@@ -618,35 +651,60 @@ class RecommendMovieView(ListView):
         
         if not user_id:
             return Movie.objects.none()
-            
+
+        has_rated_any = Movie_rating.objects.filter(user=User.objects.get(pk=user_id)).exists()
+
+        # 冷启动处理：用户未评价任何电影/用户评过电影，但评分的电影总数不足10部
+        if not has_rated_any:
+            print(f"用户{user_id}是新用户，无评分记录，启用【冷启动推荐策略】：从 Redis 获取或生成热门电影推荐")
+            return get_hot_movies_as_recommend()
+
+        user_rated_movie_count = Movie_rating.objects.filter(user__id=user_id).values('movie_id').distinct().count()
+        if user_rated_movie_count < 10:
+            print(f"用户 {user_id} 只评了 {user_rated_movie_count} 部电影，数量较少，启用冷启动推荐：热门电影")
+            return get_hot_movies_as_recommend()
+
         try:
             # 添加Redis连接错误处理
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
             self.redis_client.ping()  # 检查连接是否成功
-            
+
             # 从Redis获取推荐结果
             recommend_data = self.redis_client.get(f'recommend:{user_id}')
-            
+
             if recommend_data:
                 # 如果Redis中有推荐数据，解析并返回
                 recommend_list = json.loads(recommend_data)
                 movie_ids = [movie_id for movie_id, _ in recommend_list]
-                return Movie.objects.filter(id__in=movie_ids)
+                if movie_ids:
+                    field_order = ', '.join(str(id) for id in movie_ids)
+                    return Movie.objects.filter(id__in=movie_ids).extra(
+                        select={'manual_order': f'FIELD(id, {field_order})'},
+                        order_by=['manual_order']
+                    )
+                else:
+                    return Movie.objects.none()
             else:
                 # 如果Redis中没有推荐数据，自动生成推荐
                 print(f"Redis中没有用户 {user_id} 的推荐数据，正在生成...")
-                
+
                 # 生成推荐并存入Redis
                 generate_success = generate_recommendations_for_user(user_id)
-                
+
                 if generate_success:
                     # 重新从Redis获取推荐结果
                     recommend_data = self.redis_client.get(f'recommend:{user_id}')
                     if recommend_data:
                         recommend_list = json.loads(recommend_data)
                         movie_ids = [movie_id for movie_id, _ in recommend_list]
-                        return Movie.objects.filter(id__in=movie_ids)
-                
+                        if movie_ids:
+                            field_order = ', '.join(str(id) for id in movie_ids)
+                            return Movie.objects.filter(id__in=movie_ids).extra(
+                                select={'manual_order': f'FIELD(id, {field_order})'},
+                                order_by=['manual_order']
+                            )
+                        else:
+                            return Movie.objects.none()
                 # 如果生成推荐失败，返回空列表
                 return Movie.objects.none()
         except redis.RedisError as e:
@@ -655,6 +713,15 @@ class RecommendMovieView(ListView):
             return Movie.objects.none()
     def get_context_data(self, *, object_list=None, **kwargs):
         context = super(RecommendMovieView, self).get_context_data(*kwargs)
+
+        # 获取当前用户的的推数据
+        user_id = self.request.session.get('user_id')
+        if user_id:
+            recommend_data = self.redis_client.get(f'recommend:{user_id}')
+            if recommend_data:
+                recommend_list = json.loads(recommend_data)
+                context['recommendations'] = recommend_list
+
         paginator = context.get('paginator')
         page_obj = context.get('page_obj')
         pagination_data = self.get_pagination_data(paginator, page_obj)
@@ -694,8 +761,8 @@ def generate_recommendations_for_user(user_id):
         # 创建Flink批处理环境
         env = StreamExecutionEnvironment.get_execution_environment()
         env.set_runtime_mode(RuntimeExecutionMode.BATCH)
-        env.set_parallelism(4)
-        
+        env.set_parallelism(1)
+
         # 创建表环境
         t_env = StreamTableEnvironment.create(env)
         
@@ -737,6 +804,7 @@ def generate_recommendations_for_user(user_id):
                 SELECT user_id, movie_id, score
                 FROM movie_ratings
                 WHERE user_id <> {user_id}
+
             ),
             -- 计算用户之间的共同评分统计数据
             user_similarity_stats AS (
@@ -752,6 +820,7 @@ def generate_recommendations_for_user(user_id):
                 JOIN target_user_ratings t ON o.movie_id = t.movie_id
                 GROUP BY o.user_id
             ),
+            
             -- 计算用户相似度（纯SQL实现皮尔逊相关系数）
             user_similarities AS (
                 SELECT 
@@ -764,14 +833,15 @@ def generate_recommendations_for_user(user_id):
                              SQRT((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y))
                     END AS similarity
                 FROM user_similarity_stats
-                WHERE n >= 2
+                WHERE n >= 5
             ),
             -- 候选电影（相似用户评分的、目标用户未评分的电影）
             candidate_movies AS (
                 SELECT DISTINCT o.movie_id
+
                 FROM other_users_ratings o
                 JOIN user_similarities s ON o.user_id = s.user_id
-                WHERE s.similarity > 0.1
+                WHERE s.similarity > 0.3
                 AND o.movie_id NOT IN (
                     SELECT movie_id FROM target_user_ratings
                 )
@@ -791,16 +861,22 @@ def generate_recommendations_for_user(user_id):
             -- 生成最终推荐
             SELECT 
                 movie_id,
-                (weighted_score_sum / similarity_sum) AS recommend_score
+                CASE
+                    when similarity_sum>0 THEN LEAST(ROUND((weighted_score_sum / similarity_sum), 2), 5.0)
+                    ELSE 0.0
+                END AS recommendation_score
             FROM recommendation_scores
-            WHERE user_count >= 2
-            ORDER BY recommend_score DESC
-            LIMIT 30
+            WHERE user_count >= 3 AND similarity_sum > 0
+            ORDER BY recommendation_score DESC, movie_id ASC 
+            LIMIT 10
         """
         
         # 执行推荐查询并获取结果
         print(f"执行推荐查询...")
         result = t_env.execute_sql(recommendations_query).collect()
+        
+        # 记录查询结果
+        print(f"PyFlink查询结果: {result}")
         
         # 将结果写入Redis缓存
         redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
@@ -809,10 +885,10 @@ def generate_recommendations_for_user(user_id):
             # 转换为推荐列表格式 [(movie_id, score), ...] - 使用索引访问代替点语法
             recommendations_list = [(int(row[0]), float(row[1])) for row in result]
             redis_client.setex(f'recommend:{user_id}', 1800, json.dumps(recommendations_list))
-            print(f"成功为用户 {user_id} 生成推荐，已存入Redis")
+            print(f"PyFlink: 成功为用户 {user_id} 生成推荐 {recommendations_list}，已存入Redis")
             return True
         else:
-            print(f"未为用户 {user_id} 生成任何推荐结果")
+            print(f"PyFlink: 未为用户 {user_id} 生成任何推荐结果")
             return False
             
     except Exception as e:
@@ -871,7 +947,14 @@ def generate_recommendations_with_pandas(user_id):
             
             # 获取相似度
             similarity = user_similarity.loc[target_user_id, other_user_id]
-            if np.isnan(similarity):
+            
+            # 检查共同评分数量（与Flink版本的n >= 5对应）
+            common_movies = user_movie_matrix.loc[[target_user_id, other_user_id]].dropna(axis=1, how='any').columns
+            if len(common_movies) < 5:
+                continue
+                
+            # 添加相似度过滤条件（与Flink版本的similarity > 0.3对应）
+            if np.isnan(similarity) or similarity <= 0.3:
                 continue
             
             # 获取其他用户的评分
@@ -886,20 +969,25 @@ def generate_recommendations_with_pandas(user_id):
                 weighted_score = similarity * score
                 
                 if movie_id not in recommendations_for_user:
-                    recommendations_for_user[movie_id] = {'total_score': 0, 'total_similarity': 0}
+                    recommendations_for_user[movie_id] = {'total_score': 0, 'total_similarity': 0, 'user_count': 0}
                 
                 recommendations_for_user[movie_id]['total_score'] += weighted_score
                 recommendations_for_user[movie_id]['total_similarity'] += similarity
+                recommendations_for_user[movie_id]['user_count'] += 1
         
         # 计算最终推荐分数
         user_recommendations = []
         for movie_id, scores in recommendations_for_user.items():
-            if scores['total_similarity'] > 0:
+            # 添加至少3个用户评分的限制（与Flink版本的user_count >= 3对应）
+            if scores['total_similarity'] > 0 and scores['user_count'] >= 3:
                 final_score = scores['total_score'] / scores['total_similarity']
+                final_score = round(final_score, 2)  # 保留2位小数
+                final_score = min(final_score, 5.0)  # 限制最高分为5.0
                 user_recommendations.append((movie_id, final_score))
         
         # 按推荐分数降序排序
         user_recommendations.sort(key=lambda x: x[1], reverse=True)
+  
         recommendations[target_user_id] = user_recommendations[:10]
         
         return recommendations
